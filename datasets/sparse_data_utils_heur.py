@@ -1,0 +1,211 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import time
+
+class SparseHarDataset(Dataset):
+    """ PyTorch Dataset class to work with sparse HAR data
+
+	Parameters
+	----------
+
+	original_data: dict
+		a dict of numpy arrays where each item is the 
+        original raw data (L x C) for each body part.
+        For example: {'torso' : np.ndarray(L x 3)}
+
+	original_labels: np.ndarray
+		numpy array of length L with labels for each sample
+
+	packet_timestamps: dict
+        a dict where the keys are the body parts and the
+        values are N x 2 arrays with the start and end idx of each
+        packet observed by the sensor
+	"""
+
+    def __init__(self,
+                 original_data,
+                 original_labels,
+                 packet_timestamps):
+        
+        self.original_data = original_data
+        self.original_labels = original_labels
+        self.packet_timestamps = packet_timestamps
+        key = list(self.packet_timestamps.keys())[0]
+        if len(self.packet_timestamps[key]) == 0:
+            self.packet_size = 8
+        else:
+            self.packet_size = self.packet_timestamps[key][0][1] - self.packet_timestamps[key][0][0]
+
+        # get the packet arrival points (end times)
+        packet_arrival_times = {}
+        for bp in self.packet_timestamps.keys():
+            packet_arrival_times[bp] = self.packet_timestamps[bp][:,1] - 1
+
+        # merge across body parts
+        merged = []
+        for bp, time_stamps in self.packet_timestamps.items():
+            merged.extend([(time_stamp, bp) for time_stamp in time_stamps])
+        merged.sort(key=lambda x: x[0][1])
+        
+        self.sorted_time_stamps = [time_stamp for time_stamp, bp in merged]
+        self.packet_sources = [bp for at, bp in merged]
+        
+        # save the idx where each packet appears for each body part
+        self.packet_source_idxs = {}
+        for bp in self.original_data.keys():
+            self.packet_source_idxs[bp] = np.array([idx for idx, value in enumerate(self.packet_sources) if value == bp])
+
+        self.unique_packet_timestamps = np.unique(np.stack(self.sorted_time_stamps),axis=0)
+
+        self.labels = self.original_labels[self.unique_packet_timestamps[:,1]].astype(int)
+
+    def region_decomposition(self):
+        active_idxs = []
+        passive_idxs = []
+
+        self.sorted_arrival_times = np.stack(self.sorted_time_stamps,axis=0)[:,0]
+
+        # get the activity transition points (include starting point idx 0)
+        activity_transition_idxs = np.concatenate([np.array([0]),np.where(self.original_labels[:-1] != self.original_labels[1:])[0] + 1])
+
+        if len(self.sorted_arrival_times) > 0:
+            passive_idxs.append(np.arange(0,self.sorted_arrival_times[0]))
+        # go through all packets
+        for i in range(0,len(self.sorted_arrival_times)-1):
+            curr_packet_idx = self.sorted_arrival_times[i]
+            next_packet_idx = self.sorted_arrival_times[i+1]
+
+            # determine of there is a transition between the packets
+            idxs_between = activity_transition_idxs[(activity_transition_idxs > curr_packet_idx) & (activity_transition_idxs < next_packet_idx)]
+            if len(idxs_between) > 0: # passive region
+                # everything up until the first transition is active region
+                # everything after the first transition is passive region
+                active_idxs.append(np.arange(curr_packet_idx,idxs_between[0]))
+                passive_idxs.append(np.arange(idxs_between[0],next_packet_idx))
+            else:
+                # all active region
+                active_idxs.append(np.arange(curr_packet_idx,next_packet_idx))
+        
+        if len(self.sorted_arrival_times) > 0:
+            # after the last packet is sent, there some remaining region left
+            curr_packet_idx = self.sorted_arrival_times[-1]
+            next_packet_idx = len(self.original_labels)
+
+            # determine of there is a transition between the packets
+            idxs_between = activity_transition_idxs[(activity_transition_idxs > curr_packet_idx) & (activity_transition_idxs < next_packet_idx)]
+            if len(idxs_between) > 0: # passive region
+                # everything up until the first transition is active region
+                # everything after the first transition is passive region
+                active_idxs.append(np.arange(curr_packet_idx,idxs_between[0]))
+                passive_idxs.append(np.arange(idxs_between[0],next_packet_idx))
+            else:
+                # all active region
+                active_idxs.append(np.arange(curr_packet_idx,next_packet_idx))
+
+        if len(active_idxs) > 0:
+            self.active_region = np.concatenate(active_idxs)
+        else:
+            self.active_region = np.array([])
+        if len(passive_idxs) > 0:
+            self.passive_region = np.concatenate(passive_idxs)
+        else:
+            self.passive_region = np.array([])
+
+        return self.active_region, self.passive_region
+
+    def __getitem__(self, idx):
+        # 1. Get the reference timestamp from the requested index
+        reference_packet_timestamp = self.unique_packet_timestamps[idx]
+        reference_at = reference_packet_timestamp[1]
+
+        # Constants & Setup
+        num_packets_to_fetch = 4
+        body_parts = list(self.original_data.keys())
+
+        # Pre-allocate Tensors
+        # Shape: [num_body_parts, 4_packets, packet_size, 3_channels]
+        X = torch.zeros(
+            (len(body_parts), num_packets_to_fetch, self.packet_size, 3)
+        )
+        # Shape: [num_body_parts, 4_packets] -> Initialized to -1 for empty slots
+        AGES = torch.zeros((len(body_parts), num_packets_to_fetch)) - 1
+
+        # 2. Loop through each body part and grab the 4 most recent packets
+        for bp_i, bp in enumerate(body_parts):
+            ats = self.packet_timestamps[bp][:, 1]
+
+            # Find all packets that arrived on or before the reference time
+            prior_packets = (ats <= reference_at).nonzero()[0]
+
+            if len(prior_packets) > 0:
+                # Slice the up to 4 most recent packet indices
+                recent_packet_idxs = prior_packets[-num_packets_to_fetch:]
+
+                for i, p_idx in enumerate(recent_packet_idxs):
+                    st, en = self.packet_timestamps[bp][p_idx]
+                    w = self.original_data[bp][st:en]
+                    age = reference_at - self.packet_timestamps[bp][p_idx][1]
+
+                    # Populate the tensors
+                    X[bp_i, i, :, :] = torch.from_numpy(w)
+                    AGES[bp_i, i] = age
+
+        # 3. Rescale the ages relative to the oldest valid age found across all body parts
+        valid_ages_mask = AGES >= 0
+        if valid_ages_mask.any():
+            max_age = AGES[valid_ages_mask].max()
+
+            # Prevent division by zero if the only packet found has an age of exactly 0
+            if max_age > 0:
+                AGES[valid_ages_mask] = AGES[valid_ages_mask] / max_age
+            else:
+                # If max_age is 0, all valid ages are 0, so they stay 0
+                AGES[valid_ages_mask] = 0.0
+
+        # 4. Handle the label
+        label = torch.tensor(self.original_labels[reference_at]).long()
+
+        data_dict = {
+            'data' : X.float(),
+            'ages' : AGES.float(),
+            'arrival_time' : reference_at
+        }
+
+        return data_dict, label
+    
+    def __len__(self):
+        return len(self.unique_packet_timestamps)
+    
+
+def collate_sparse_sensor_data(batch):
+    print(batch)
+    exit()
+    packets, labels = zip(*batch)
+
+    collated_packets = {}
+    bps = packets[0].keys()
+    for bp in bps:
+        collated_packets[bp] = {}
+        for key in batch[0][bp]:
+            collated_packets[bp][key] = np.stack([item[bp][key] for item in batch], axis=0)
+
+    labels = np.array([item[1] for item in batch])
+    
+    collated_packets, labels
+
+if __name__ == '__main__':
+    original_data = {f"bp{i}" : np.zeros((100,3)) for i in range(2)}
+    original_labels = np.zeros(100)
+    packet_timestamps = {f"bp0" : np.array([[0,8],[1,9],[2,10],[3,11],[4,12],[5,13],[6,14],[30,38]]),
+                         f"bp1" : np.array([[0,8],[1,9],[2,10],[3,11],[4,12],[5,13],[6,14],[30,38]])+30}
+
+    sd = SparseHarDataset(original_data,original_labels,packet_timestamps)
+    
+    dl = DataLoader(sd,batch_size=2)
+    x = next(iter(dl))
+    print(x)
+    print(x[0]['bp0']['data'].shape,x[0]['bp0']['age'].shape)
+    print(x[0]['bp1']['data'].shape,x[0]['bp1']['age'].shape)
