@@ -20,7 +20,7 @@ The following steps give a high level outline of how to reproduce the paper resu
 4. Finally, run the code to generate the figures from the test results which represents the final outputs shown in the paper.
 
 # Directory Structure
-We provide a high-level breakdown of the directories in this code repository. **Make sure you install this repo in your home directory (~) for the code to run successfully (~/BHAR_codes_artifact).**
+We provide a high-level breakdown of the directories in this code repository. **Make sure you install this repo in your home directory for the code to run successfully (~/BHAR_codes_artifact).**
 
 **Root Directory**  
 The current directory (BHAR_codes_artifact) is referred to as the *root* directory of the project. It is the top level directory where all the other files fall under (other than the raw dataset files which are installed in a separate directory as explained in [`INSTALL.md`](./INSTALL.md)). At the top level we have the documentation markdown files ([`README.md`](./README.md), [`REQUIREMENTS.md`](./REQUIREMENTS.md), [`INSTALL.md`](./INSTALL.md)), license ([`LICENSE`](./LICENSE)), dependency specification ([`pyproject.toml`](./pyproject.toml)), and the accepted paper [PDF](./CODES_2026_BHAR_accepted.pdf). There is also a directory_config.yaml file which specifies the paths to the downloaded datasets. Please do not modify these paths. It is assumed that you will follow the dataset installation instructions without changing the default directory locations.
